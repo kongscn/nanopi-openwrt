@@ -1,3 +1,11 @@
+Personal Changes
+
+- seperate build and dist step
+- use repo's build cache
+- resize build cache image size to 30G
+- add wireguard by default
+- set lan ip to 10.10.10.1
+
 # Nanopi R1S R2S R4S Openwrt 固件
 
 [刷机工具](https://www.balena.io/etcher/)  

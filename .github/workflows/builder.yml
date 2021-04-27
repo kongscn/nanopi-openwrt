@@ -1,0 +1,200 @@
+name: builder
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      device:
+        description: 'select device to build'
+        default: 'r2s'
+        required: false
+
+jobs:
+
+  build_packages:
+    name: Build ${{ github.event.client_payload.device || github.event.inputs.device }} packages
+    runs-on: ubuntu-18.04
+    env:
+      DEVICE: ${{ github.event.client_payload.device || github.event.inputs.device }}
+
+    steps:
+
+      - name: Space cleanup
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo sysctl vm.swappiness=0
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android/sdk
+          sudo -E apt update
+          sudo -E apt -y --no-install-recommends install \
+            jq build-essential asciidoc binutils bzip2 gawk \
+            gettext git libncurses5-dev libz-dev patch unzip \
+            zlib1g-dev lib32gcc1 libc6-dev-i386 subversion flex \
+            uglifyjs git-core gcc-multilib g++-multilib \
+            p7zip p7zip-full msmtp libssl-dev texinfo \
+            libreadline-dev libglib2.0-dev xmlto qemu-utils \
+            upx libelf-dev autoconf automake libtool autopoint \
+            ccache curl wget vim nano python python3 python3-pip \
+            python-ply python3-ply haveged lrzsz device-tree-compiler \
+            scons antlr3 gperf intltool rsync swig
+
+      - uses: actions/checkout@v2
+        with:
+          fetch-depth: 1
+
+      - name: Checkout
+        run: |
+          cd
+          curl -sL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/zstd-bin/zstd | sudo tee /usr/bin/zstd > /dev/null
+          
+          for i in $(seq -f "%02g" 1 20)
+          do
+            curl -sL --fail https://github.com/$GITHUB_REPOSITORY/releases/download/cache/lede.$DEVICE.img.zst.$i || break
+          done | zstdmt -d -o lede.img || echo "personal cache files not found, try original from klever1988"
+
+          if [ ! -f "lede.img" ]; then
+            echo "previous cache not found, use cache from klever1988."
+            for i in $(seq -f "%02g" 1 20)
+            do
+              # for first time compile, download precompiled files using the following line instead
+              curl -sL --fail https://github.com/klever1988/sshactions/releases/download/cache/lede.$DEVICE.img.zst.$i || break
+            done | zstdmt -d -o lede.img || echo "download cache files from klever1988 failed, try build from scratch"
+          fi
+
+          if [ ! -f "lede.img" ]; then
+            echo "WARNING: failed to download precompiled image"
+            truncate -s 30g lede.img
+            mkfs.btrfs -M lede.img
+          fi
+
+          qemu-img resize -f raw lede.img 30G
+          LOOP_DEVICE=$(losetup -f) && echo "LOOP_DEVICE=$LOOP_DEVICE" >> $GITHUB_ENV
+          sudo losetup -P --direct-io $LOOP_DEVICE lede.img
+          mkdir lede && sudo mount -o nossd,compress=zstd $LOOP_DEVICE lede
+          # resize
+          # https://superuser.com/questions/610819/how-to-resize-img-file-created-with-dd
+          # https://access.redhat.com/documentation/en-us/red_hat_enterprise_linux/7/html/storage_administration_guide/resizing-btrfs
+          sudo btrfs filesystem resize 30G lede
+          df -h
+          if [ -d 'lede/.git' ]; then
+            cd lede && git config --local user.email "action@github.com" && git config --local user.name "GitHub Action"
+            git fetch && git reset --hard origin/openwrt-18.06-k5.4
+          else
+            sudo chown $USER:$(id -gn) lede && git clone -b openwrt-18.06-k5.4 --single-branch https://github.com/immortalwrt/immortalwrt lede
+          fi
+          df -h
+
+      - name: Update feeds and packages
+        run: |
+          df -h
+          cd ~/lede
+          if [ -d 'feeds' ]; then
+            pushd feeds/packages; git restore .; popd
+            pushd feeds/luci; git restore .; popd
+            pushd feeds/routing; git restore .; popd
+            pushd feeds/telephony; git restore .; popd
+          fi
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+          . $GITHUB_WORKSPACE/merge_packages.sh
+          . $GITHUB_WORKSPACE/patches.sh
+          cd
+          svn export https://github.com/openwrt/luci/branches/openwrt-18.06 luci
+          echo > more_luci.txt
+          pushd luci
+          ls -d */ | xargs -n1 -i diff -q {} ../lede/feeds/luci/{} | grep Only | grep lede | grep -E applications\|themes | awk '{print $4}' | xargs -n1 -i echo CONFIG_PACKAGE_{}=m >> ~/lede/more_luci.txt
+          popd
+          df -h
+
+      - name: Custom configure file
+        run: |
+          df -h
+          cd ~/lede
+          cat $GITHUB_WORKSPACE/$DEVICE.config.seed | sed 's/\(CONFIG_PACKAGE_luci-app-[^A-Z]*=\)y/\1m/' > .config
+          find package/ -type d -name luci-app-* | rev | cut -d'/' -f1 | rev | xargs -n1 -i echo CONFIG_PACKAGE_{}=m >> .config
+          cat $GITHUB_WORKSPACE/extra_packages.seed >> .config
+          cat more_luci.txt >> .config
+          make defconfig && cat .config
+          df -h
+
+      - name: Build and deploy packages
+        run: |
+          cd ~/lede
+
+          echo "======================="
+          echo "Space usage:"
+          echo "======================="
+          df -h
+          echo "======================="
+
+          while true; do make download -j && break || true; done
+          # for debug
+          # make -j1 V=s
+          make -j$[`nproc`+1] IGNORE_ERRORS=1
+          mv `ls ~/lede/bin/targets/*/*/*imagebuilder*xz` ~/ib-$DEVICE.tar.xz
+
+          echo "======================="
+          echo "Space usage:"
+          echo "======================="
+          df -h
+          echo "======================="
+
+      - name: Prepare artifact
+        run: |
+          cd
+          mkdir -p ./artifact/buildinfo
+          cd lede
+          cp -rf $(find ./bin/targets/ -type f -name "*.buildinfo" -o -name "*.manifest") ../artifact/buildinfo/
+          cp -rf .config ../artifact/buildinfo/
+          echo "strDate=$(TZ=UTC-8 date +%Y-%m-%d)" >> $GITHUB_ENV
+          echo "strDevice=$(echo $DEVICE | awk '{print toupper($0)}')" >> $GITHUB_ENV
+          rm -rf bin tmp
+          cd ..
+          mv artifact $GITHUB_WORKSPACE
+
+      - name: Deliver buildinfo
+        uses: actions/upload-artifact@v2
+        with:
+          name: OpenWrt_buildinfo
+          path: ./artifact/buildinfo/
+
+      - name: prepare cache files
+        run: |
+          cd
+          sleep 120
+          sudo umount lede
+          sudo losetup -d $LOOP_DEVICE
+          zstdmt -c --long lede.img | split --numeric=1 -b 2000m - lede.$DEVICE.img.zst.
+          mkdir -p $GITHUB_WORKSPACE/release
+          mv ~/ib-$DEVICE.tar.xz $GITHUB_WORKSPACE/release/
+          mv ~/*.img.zst.* $GITHUB_WORKSPACE/release/
+
+      - name: Save cache state
+        uses: svenstaro/upload-release-action@v2
+        with:
+          repo_token: ${{ secrets.GITHUB_TOKEN }}
+          file: release/*
+          tag: cache
+          file_glob: true
+          overwrite: true
+          prerelease: true
+          release_name: cache files
+
+      - name: send finish message
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: 🍺 ${{ github.repository }} ${{ github.workflow }} finished.
+
+      - name: send failure message
+        if: ${{ failure() }}
+        uses: appleboy/telegram-action@master
+        with:
+          to: ${{ secrets.TELEGRAM_TO }}
+          token: ${{ secrets.TELEGRAM_TOKEN }}
+          message: 🤔 ${{ github.repository }} ${{ github.workflow }} failed! Starting tmate for debug.
+
+      - name: Debug via tmate
+        if: ${{ failure() }}
+        uses: mxschmitt/action-tmate@v3.5
