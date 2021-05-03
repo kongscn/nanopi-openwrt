@@ -22,13 +22,14 @@ if [ $DEVICE = 'r2s' ]; then
     echo -e "\toption maxfreq0 '1512000'\n" >> package/lean/luci-app-cpufreq/root/etc/config/cpufreq
 fi
 
-if [ $DEVICE = 'r4s' ]; then
-    wget https://github.com/immortalwrt/immortalwrt/commit/6c3f6d2686679173b95495c47d861db1f41729dd.patch
-    sed -i 's/ctcgfw/kernel/g' 6c3f6d2686679173b95495c47d861db1f41729dd.patch
-    git apply 6c3f6d2686679173b95495c47d861db1f41729dd.patch
-    rm 6c3f6d2686679173b95495c47d861db1f41729dd.patch
-    sed -i 's/r8169/r8168/' target/linux/rockchip/image/armv8.mk
-fi
+# fix r4s build for https://github.com/immortalwrt/immortalwrt/commit/4177c3c85d293e041e497bd05381ed6418f84271
+# if [ $DEVICE = 'r4s' ]; then
+#     wget https://github.com/immortalwrt/immortalwrt/commit/6c3f6d2686679173b95495c47d861db1f41729dd.patch
+#     sed -i 's/ctcgfw/kernel/g' 6c3f6d2686679173b95495c47d861db1f41729dd.patch
+#     git apply 6c3f6d2686679173b95495c47d861db1f41729dd.patch
+#     rm 6c3f6d2686679173b95495c47d861db1f41729dd.patch
+#     sed -i 's/r8169/r8168/' target/linux/rockchip/image/armv8.mk
+# fi
 
 if [[ $DEVICE =~ ('r2s'|'r4s'|'r1p') ]]; then
     wget https://github.com/coolsnowwolf/lede/raw/757e42d70727fe6b937bb31794a9ad4f5ce98081/target/linux/rockchip/config-default -NP target/linux/rockchip/
